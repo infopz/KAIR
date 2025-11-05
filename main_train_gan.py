@@ -7,6 +7,7 @@ import logging
 from torch.utils.data import DataLoader
 from torch.utils.data.distributed import DistributedSampler
 import torch
+from datetime import timedelta
 
 from utils import utils_logger
 from utils import utils_image as util
@@ -15,6 +16,10 @@ from utils.utils_dist import get_dist_info, init_dist
 
 from data.select_dataset import define_Dataset
 from models.select_model import define_Model
+
+import wandb
+
+os.environ["WANDB_DIR"] = "/homes/gcasari/bigbrain/work_data/wandb_log"
 
 
 '''
@@ -38,7 +43,7 @@ def main(json_path='options/train_msrresnet_gan.json'):
     parser = argparse.ArgumentParser()
     parser.add_argument('--opt', type=str, default=json_path, help='Path to option JSON file.')
     parser.add_argument('--launcher', default='pytorch', help='job launcher')
-    parser.add_argument('--local_rank', type=int, default=0)
+    parser.add_argument('--local-rank', type=int, default=0)
     parser.add_argument('--dist', default=False)
 
     opt = option.parse(parser.parse_args().opt, is_train=True)
@@ -48,7 +53,7 @@ def main(json_path='options/train_msrresnet_gan.json'):
     # distributed settings
     # ----------------------------------------
     if opt['dist']:
-        init_dist('pytorch')
+        init_dist(launcher='pytorch', timeout=timedelta(minutes=45))
     opt['rank'], opt['world_size'] = get_dist_info()
 
     if opt['rank'] == 0:
@@ -94,6 +99,12 @@ def main(json_path='options/train_msrresnet_gan.json'):
         utils_logger.logger_info(logger_name, os.path.join(opt['path']['log'], logger_name+'.log'))
         logger = logging.getLogger(logger_name)
         logger.info(option.dict2str(opt))
+
+        wandb_logger = wandb.init(entity="infopz-team",
+                                  project="BigBrain-KAIR",
+                                  name=opt["task"],
+                                  config=opt)
+
 
     # ----------------------------------------
     # seed
@@ -196,59 +207,88 @@ def main(json_path='options/train_msrresnet_gan.json'):
             if current_step % opt['train']['checkpoint_print'] == 0 and opt['rank'] == 0:
                 logs = model.current_log()  # such as loss
                 message = '<epoch:{:3d}, iter:{:8,d}, lr:{:.3e}> '.format(epoch, current_step, model.current_learning_rate())
+
+                loss_dict = {}
                 for k, v in logs.items():  # merge log information into message
                     message += '{:s}: {:.3e} '.format(k, v)
+
+                    loss_dict[f"train/{k}"] = v
                 logger.info(message)
+
+                wandb_logger.log(loss_dict, step=current_step)
 
             # -------------------------------
             # 5) save model
             # -------------------------------
             if current_step % opt['train']['checkpoint_save'] == 0 and opt['rank'] == 0:
+
                 logger.info('Saving the model.')
                 model.save(current_step)
+
 
             # -------------------------------
             # 6) testing
             # -------------------------------
-            if current_step % opt['train']['checkpoint_test'] == 0 and opt['rank'] == 0:
+            if current_step % opt['train']['checkpoint_test'] == 0:
 
-                avg_psnr = 0.0
-                idx = 0
+                # Synchronize all ranks before validation
+                if opt['dist']:
+                    torch.distributed.barrier()
 
-                for test_data in test_loader:
-                    idx += 1
-                    image_name_ext = os.path.basename(test_data['L_path'][0])
-                    img_name, ext = os.path.splitext(image_name_ext)
+                if opt["rank"] == 0:
 
-                    img_dir = os.path.join(opt['path']['images'], img_name)
-                    util.mkdir(img_dir)
+                    mdl_g = model.netG.module if isinstance(model.netG, torch.nn.parallel.DistributedDataParallel) else model.netG
 
-                    model.feed_data(test_data)
-                    model.test()
+                    avg_psnr = 0.0
+                    idx = 0
 
-                    visuals = model.current_visuals()
-                    E_img = util.tensor2uint(visuals['E'])
-                    H_img = util.tensor2uint(visuals['H'])
+                    for test_data in test_loader:
 
-                    # -----------------------
-                    # save estimated image E
-                    # -----------------------
-                    save_img_path = os.path.join(img_dir, '{:s}_{:d}.png'.format(img_name, current_step))
-                    util.imsave(E_img, save_img_path)
+                        idx += 1
+                        image_name_ext = os.path.basename(test_data['L_path'][0])
+                        img_name, ext = os.path.splitext(image_name_ext)
 
-                    # -----------------------
-                    # calculate PSNR
-                    # -----------------------
-                    current_psnr = util.calculate_psnr(E_img, H_img, border=border)
+                        img_dir = os.path.join(opt['path']['images'], img_name)
+                        util.mkdir(img_dir)
 
-                    logger.info('{:->4d}--> {:>10s} | {:<4.2f}dB'.format(idx, image_name_ext, current_psnr))
+                        model.feed_data(test_data)
 
-                    avg_psnr += current_psnr
+                        mdl_g.eval()
+                        with torch.no_grad():
+                            model.E = mdl_g(model.L)
+                        mdl_g.train()
 
-                avg_psnr = avg_psnr / idx
+                        #mdl.test()
 
-                # testing log
-                logger.info('<epoch:{:3d}, iter:{:8,d}, Average PSNR : {:<.2f}dB\n'.format(epoch, current_step, avg_psnr))
+                        visuals = model.current_visuals()
+                        E_img = util.tensor2uint(visuals['E'])
+                        H_img = util.tensor2uint(visuals['H'])
+
+                        # -----------------------
+                        # save estimated image E
+                        # -----------------------
+                        save_img_path = os.path.join(img_dir, '{:s}_{:d}.png'.format(img_name, current_step))
+                        util.imsave(E_img, save_img_path)
+
+                        # -----------------------
+                        # calculate PSNR
+                        # -----------------------
+                        current_psnr = util.calculate_psnr(E_img, H_img, border=border)
+
+                        logger.info('{:->4d}--> {:>10s} | {:<4.2f}dB'.format(idx, image_name_ext, current_psnr))
+
+                        avg_psnr += current_psnr
+
+                    avg_psnr = avg_psnr / idx
+
+                    # testing log
+                    logger.info('<epoch:{:3d}, iter:{:8,d}, Average PSNR : {:<.2f}dB\n'.format(epoch, current_step, avg_psnr))
+
+                    wandb_logger.log({"val/pnsr": avg_psnr}, step=current_step)
+                
+                # Synchronize all ranks before validation
+                if opt['dist']:
+                    torch.distributed.barrier()
 
 if __name__ == '__main__':
     main()

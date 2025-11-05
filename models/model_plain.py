@@ -12,6 +12,8 @@ from models.loss_ssim import SSIMLoss
 from utils.utils_model import test_mode
 from utils.utils_regularizers import regularizer_orth, regularizer_clip
 
+from lpips import LPIPS
+
 
 class ModelPlain(ModelBase):
     """Train with pixel loss"""
@@ -25,6 +27,8 @@ class ModelPlain(ModelBase):
         self.netG = self.model_to_device(self.netG)
         if self.opt_train['E_decay'] > 0:
             self.netE = define_G(opt).to(self.device).eval()
+
+        self.lpips_loss_fn = LPIPS(net='vgg').to(self.device)  # Initialize LPIPS loss
 
     """
     # ----------------------------------------
@@ -163,7 +167,12 @@ class ModelPlain(ModelBase):
     def optimize_parameters(self, current_step):
         self.G_optimizer.zero_grad()
         self.netG_forward()
-        G_loss = self.G_lossfn_weight * self.G_lossfn(self.E, self.H)
+        pixel_loss = self.G_lossfn_weight * self.G_lossfn(self.E, self.H)
+        percep_loss = 0.05 * self.lpips_loss_fn(self.E, self.H).mean()
+
+        # Combine the losses (you can adjust the weight for LPIPS loss)
+        G_loss = pixel_loss + percep_loss  # Adjust the weight as needed
+        
         G_loss.backward()
 
         # ------------------------------------

@@ -104,7 +104,7 @@ class ModelBase():
         if self.opt['dist']:
             find_unused_parameters = self.opt.get('find_unused_parameters', True)
             use_static_graph = self.opt.get('use_static_graph', False)
-            network = DistributedDataParallel(network, device_ids=[torch.cuda.current_device()], find_unused_parameters=find_unused_parameters)
+            network = DistributedDataParallel(network, device_ids=[torch.cuda.current_device()], find_unused_parameters=find_unused_parameters, broadcast_buffers=False)
             if use_static_graph:
                 print('Using static graph. Make sure that "unused parameters" will not change during training loop.')
                 network._set_static_graph()
